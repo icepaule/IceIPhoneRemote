@@ -1,0 +1,22 @@
+sequenceDiagram
+  autonumber
+  participant H as Rechner (bridge.py)
+  participant E as ESP32-S3
+  participant P as iPhone
+  P->>E: WLAN-Hotspot ESP32Agent beitreten
+  P->>E: AirPlay: pair-setup, pair-verify, fp-setup
+  P->>E: SETUP, RECORD, Mirror-Stream auf :7100
+  loop Bildschirm aendert sich
+    P-->>E: H.264 Access Unit
+    E->>E: GOP seit letztem IDR im PSRAM
+  end
+  H->>E: auth Token
+  E-->>H: 0 ok auth
+  H->>E: 5 snap
+  E-->>H: V-Frames (SPS/PPS + GOP)
+  H->>H: ffmpeg dekodiert, letztes Bild als PNG
+  H->>E: 1 move 200 100
+  E->>P: USB-HID Maus-Reports
+  P-->>E: Zeiger bewegt, Symbol hervorgehoben
+  H->>E: 2 click
+  E->>P: USB-HID Klick

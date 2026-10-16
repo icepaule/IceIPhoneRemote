@@ -1,0 +1,10 @@
+flowchart TB
+  PH["iPhone 13 Pro<br/>Lightning"]
+  AD["Lightning-auf-USB-3-Kamera-Adapter<br/>mit Ladeanschluss"]
+  PSU["Netzteil 5 V<br/>am Ladeanschluss des Adapters"]
+  ESP["ESP32-S3 N16R8<br/>nativer USB-Port"]
+  PC["Linux-Rechner<br/>nur zum Flashen, danach abziehen"]
+  PH --- AD
+  PSU --- AD
+  AD -- "USB-A auf USB-C" --> ESP
+  PC -. "nur Flash/Debug, nie parallel zum iPhone" .-> ESP

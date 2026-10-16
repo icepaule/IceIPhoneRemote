@@ -1,0 +1,353 @@
+diff --git a/hardware/flash.sh b/hardware/flash.sh
+index 1c5dc13..2269102 100755
+--- a/hardware/flash.sh
++++ b/hardware/flash.sh
+@@ -11,7 +11,7 @@
+ # bootloader with a 1200-baud touch; a blank board is flashed directly.
+ set -euo pipefail
+ cd "$(dirname "$0")"
+-FQBN="esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc,FlashSize=8M,PSRAM=opi,PartitionScheme=default_8MB"
++FQBN="esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc,FlashSize=16M,PSRAM=opi,PartitionScheme=default_8MB"
+ port() { for p in /dev/cu.usbmodem* /dev/ttyACM*; do [[ -e $p ]] && { echo "$p"; return; }; done; }
+ PORT="" DEFS="" BUILD_ONLY=0
+ for a in "$@"; do
+@@ -19,13 +19,14 @@ for a in "$@"; do
+     --debug) DEFS+=" -DDEBUG_SERIAL=1" ;;
+     --sta) [[ -f hid_bridge/secrets.h ]] || { echo "--sta needs hid_bridge/secrets.h (see secrets.example.h)"; exit 1; }
+            DEFS+=" -DSTA_FROM_SECRETS=1" ;;
++    --apsta) [[ -f hid_bridge/secrets.h ]] || { echo "--apsta needs hid_bridge/secrets.h (see secrets.example.h)"; exit 1; }
++           DEFS+=" -DAPSTA_FROM_SECRETS=1" ;;
+     --build-only) BUILD_ONLY=1 ;;
+     --ap-tune) DEFS+=" -DAP_TUNE=1" ;;
+     *) PORT=$a ;;
+   esac
+ done
+ [[ $PWD != *" "* ]] || { echo "the -include path below cannot contain spaces: $PWD"; exit 1; }
+-DEFS+=" -include $PWD/hid_bridge/nimble_cfg.h"
+ FLAGS=(--build-property "compiler.cpp.extra_flags=$DEFS" --build-property "compiler.c.extra_flags=$DEFS")
+ 
+ arduino-cli compile -b "$FQBN" "${FLAGS[@]}" --output-dir build hid_bridge
+diff --git a/hardware/hid_bridge/hid_bridge.ino b/hardware/hid_bridge/hid_bridge.ino
+index 2c21bb8..766173b 100644
+--- a/hardware/hid_bridge/hid_bridge.ino
++++ b/hardware/hid_bridge/hid_bridge.ino
+@@ -14,6 +14,10 @@
+ #include "USBHIDKeyboard.h"
+ #include "USBHIDConsumerControl.h"
+ #include "tusb.h"
++#include <ArduinoOTA.h>
++#if __has_include("secrets.h")
++#include "secrets.h"
++#endif
+ #include "ble_link.h"
+ #include "netcfg.h"
+ #include "video_link.h"
+@@ -140,6 +144,7 @@ String board(const String &line, const String &id) {
+     ble_reply(cmd + " " + arg);         // every peer sees it; each side ignores lines it doesn't handle
+     return "ok";
+   }
++  if (cmd == "netinfo") return "ok " + net_json();  // hotspot credentials, for joining the phone
+   if (cmd == "snap") { video_snap(id); return ""; }  // replies when the GOP is sent
+   if (cmd == "bench") {
+     if (n < 1 || a <= 0 || a > 4096) return "err usage: bench KB (1-4096)";
+@@ -235,6 +240,11 @@ void setup() {
+   esp_task_wdt_add(NULL);
+ 
+   net_begin();
++#ifdef BRIDGE_TOKEN
++  ArduinoOTA.setHostname("iphone-agent");
++  ArduinoOTA.setPassword(BRIDGE_TOKEN);
++  ArduinoOTA.begin();
++#endif
+   if (!video_begin()) Serial.println("video: no PSRAM for the GOP buffer");
+   ble_begin("ESP32 Agent " + board_suffix());
+   startAirplay();
+@@ -249,6 +259,9 @@ void loop() {
+   static bool linked = false;
+   esp_task_wdt_reset();
+   net_poll();
++#ifdef BRIDGE_TOKEN
++  ArduinoOTA.handle();
++#endif
+   if (linked && !ble_connected()) {
+     mouse.release(MOUSE_LEFT);  // a gesture cut off mid-way must not leave the button held (long press)
+     keyboard.releaseAll();
+diff --git a/hardware/hid_bridge/ble_link.cpp b/hardware/hid_bridge/legacy/ble_link.cpp
+similarity index 100%
+rename from hardware/hid_bridge/ble_link.cpp
+rename to hardware/hid_bridge/legacy/ble_link.cpp
+diff --git a/hardware/hid_bridge/nimble_cfg.h b/hardware/hid_bridge/legacy/nimble_cfg.h
+similarity index 100%
+rename from hardware/hid_bridge/nimble_cfg.h
+rename to hardware/hid_bridge/legacy/nimble_cfg.h
+diff --git a/hardware/hid_bridge/netcfg.cpp b/hardware/hid_bridge/netcfg.cpp
+index b4ea778..118666c 100644
+--- a/hardware/hid_bridge/netcfg.cpp
++++ b/hardware/hid_bridge/netcfg.cpp
+@@ -8,9 +8,15 @@
+ #include <esp_coexist.h>
+ #include <esp_wifi.h>
+ 
+-#if STA_FROM_SECRETS
++#ifndef APSTA_FROM_SECRETS
++#define APSTA_FROM_SECRETS 0
++#endif
++#ifndef STA_FROM_SECRETS
++#define STA_FROM_SECRETS 0
++#endif
++#if STA_FROM_SECRETS || APSTA_FROM_SECRETS
+ #if __has_include("secrets.h")
+-#include "secrets.h"  // WIFI_SSID, WIFI_PASS (git-ignored)
++#include "secrets.h"  // WIFI_SSID, WIFI_PASS, BRIDGE_TOKEN (git-ignored)
+ #define BOOT_STA 1
+ #else
+ #warning "STA_FROM_SECRETS set but secrets.h is missing: booting as SoftAP"
+@@ -78,6 +84,17 @@ static void startWifi() {
+   WiFi.setHostname("iphone-agent");
+   if (mode == "off") {  // diagnostics: BLE alone on the radio
+     WiFi.mode(WIFI_OFF);
++  } else if (mode == "apsta") {  // hotspot for the phone + client of the home network (TCP bridge, OTA)
++    WiFi.mode(WIFI_AP_STA);
++    WiFi.setAutoReconnect(false);
++    retryGap = 5000;
++    retryAt = millis() + retryGap;
++    WiFi.begin(staSsid.c_str(), staPass.c_str());
++    // Join first: the hotspot must sit on the home network's channel, or the station handshake fails.
++    for (int i = 0; i < 100 && WiFi.status() != WL_CONNECTED; i++) delay(100);
++    WiFi.softAP(apSsid.c_str(), apPass.c_str(), WiFi.status() == WL_CONNECTED ? WiFi.channel() : 6, 0, 4);
++    WiFi.setTxPower(WIFI_POWER_11dBm);  // must reach the home AP; lower it if the phone drops USB power
++    noDefaultRoute();
+   } else if (mode == "sta") {
+     WiFi.mode(WIFI_STA);  // keep modem sleep on: required while BLE shares the radio
+     WiFi.setAutoReconnect(false);
+@@ -127,11 +144,11 @@ void net_begin() {
+   staSsid = prefs.getString("sta_ssid", "");
+   staPass = prefs.getString("sta_pass", "");
+ #ifdef BOOT_STA
+-  mode = "sta";  // build-time test mode, not stored
++  mode = APSTA_FROM_SECRETS ? "apsta" : "sta";  // build-time mode, not stored
+   staSsid = WIFI_SSID;
+   staPass = WIFI_PASS;
+ #endif
+-  if (mode == "sta" && staSsid.isEmpty()) mode = "ap";
++  if ((mode == "sta" || mode == "apsta") && staSsid.isEmpty()) mode = "ap";
+   startWifi();
+   net_coex("balance");
+ }
+@@ -157,7 +174,7 @@ void net_request(const String &json) {
+ }
+ 
+ static void retrySta() {
+-  if (mode != "sta") return;
++  if (mode != "sta" && mode != "apsta") return;
+   if (WiFi.status() == WL_CONNECTED) {
+     retryGap = 5000;
+     return;
+@@ -199,11 +216,12 @@ String net_json() {
+ }
+ 
+ const char *net_mode() {
++  if (mode == "apsta") return WiFi.status() == WL_CONNECTED ? "apsta" : "ap";
+   if (mode == "sta") return WiFi.status() == WL_CONNECTED ? "sta" : "none";
+   return "ap";
+ }
+ 
+-String net_ip() { return mode == "sta" ? WiFi.localIP().toString() : WiFi.softAPIP().toString(); }
++String net_ip() { return mode == "sta" || mode == "apsta" ? WiFi.localIP().toString() : WiFi.softAPIP().toString(); }
+ int net_peers() { return mode == "sta" ? WiFi.status() == WL_CONNECTED : WiFi.softAPgetStationNum(); }
+ bool net_up() { return mode == "sta" ? WiFi.status() == WL_CONNECTED : true; }
+ 
+diff --git a/hardware/hid_bridge/secrets.example.h b/hardware/hid_bridge/secrets.example.h
+index f2a259f..d27213b 100644
+--- a/hardware/hid_bridge/secrets.example.h
++++ b/hardware/hid_bridge/secrets.example.h
+@@ -1,4 +1,5 @@
+-// Only for test builds: `hardware/flash.sh --sta` boots the board as a Wi-Fi station on this
+-// network instead of its own hotspot (e.g. to mirror a Mac to it). Copy to secrets.h (git-ignored).
++// Copy to secrets.h (git-ignored). Used by `hardware/flash.sh --apsta`: the board keeps its hotspot for the
++// iPhone and also joins this network, where it serves the TCP bridge (port 7300) and OTA.
+ #define WIFI_SSID "your-wifi"
+ #define WIFI_PASS "your-password"
++#define BRIDGE_TOKEN "long-random-token"  // first line a TCP client must send: "auth <token>"; also the OTA password
+diff --git a/hardware/hid_bridge/tcp_link.cpp b/hardware/hid_bridge/tcp_link.cpp
+new file mode 100644
+index 0000000..5434278
+--- /dev/null
++++ b/hardware/hid_bridge/tcp_link.cpp
+@@ -0,0 +1,163 @@
++// TCP replacement for the BLE link (same API as ble_link.h, so the HID and AirPlay code are untouched).
++// One authenticated client at a time on port 7300. Host -> board: text lines `<id> <command>`, the first one
++// `auth <token>`. Board -> host: frames [type u8][len u16 LE][payload], type 'R' reply line, 'S' status JSON,
++// 'V' video chunk (same chunk layout as docs/ble-protocol.md, payload up to 1400 bytes).
++#include "ble_link.h"
++#include <WiFi.h>
++#include <atomic>
++#if __has_include("secrets.h")
++#include "secrets.h"
++#endif
++#ifndef BRIDGE_TOKEN
++#error "TCP bridge needs BRIDGE_TOKEN in hid_bridge/secrets.h (see secrets.example.h)"
++#endif
++
++#if DEBUG_SERIAL
++#define TCP_LOG(...) Serial.printf("tcp: " __VA_ARGS__)
++#else
++#define TCP_LOG(...) ((void)0)
++#endif
++const uint16_t PORT = 7300;  // AirPlay uses 7000, 7010-7012 and 7100
++const size_t RX_MAX = 1024;
++const uint32_t AUTH_MS = 5000;
++const uint32_t VIDEO_TIMEOUT_MS = 1500, REPLY_TIMEOUT_MS = 3000, STATUS_TIMEOUT_MS = 300;
++
++static WiFiServer server(PORT);
++static WiFiClient client;
++static SemaphoreHandle_t txLock;
++static volatile bool authed, dropClient;
++static String rx;
++static uint32_t connectedAt;
++static uint32_t winStart, winBytes;
++static volatile uint32_t kbps;
++static std::atomic<uint32_t> drops, replyDrops;
++
++static bool constEq(const String &a, const char *b) {
++  size_t n = strlen(b);
++  uint8_t d = a.length() != n;
++  for (size_t i = 0; i < n; i++) d |= (i < a.length() ? a[i] : 0) ^ b[i];
++  return d == 0;
++}
++
++static bool writeAll(const uint8_t *p, size_t n, uint32_t timeoutMs) {
++  uint32_t start = millis();
++  while (n) {
++    size_t w = client.write(p, n);
++    p += w;
++    n -= w;
++    if (n && millis() - start > timeoutMs) return false;
++    if (n) delay(2);
++  }
++  return true;
++}
++
++// Callers run on different tasks; the loop task owns closing the socket (dropClient).
++static bool sendFrame(char type, const uint8_t *p, size_t n, uint32_t timeoutMs) {
++  if (!authed) return false;
++  xSemaphoreTake(txLock, portMAX_DELAY);
++  if (!authed) { xSemaphoreGive(txLock); return false; }  // the client was replaced while we waited
++  static uint8_t buf[3 + 1500];  // header + payload in one write: one TCP segment per frame
++  bool ok = !dropClient && n <= 1500;
++  if (ok) {
++    buf[0] = type; buf[1] = n; buf[2] = n >> 8;
++    memcpy(buf + 3, p, n);
++    ok = writeAll(buf, 3 + n, timeoutMs);
++  }
++  if (!ok) { authed = false; dropClient = true; TCP_LOG("tx failed, dropping client\n"); }
++  xSemaphoreGive(txLock);
++  return ok;
++}
++
++void ble_begin(const String &) {
++  txLock = xSemaphoreCreateMutex();
++  server.begin();
++  server.setNoDelay(true);
++}
++
++bool ble_connected() { return authed; }
++
++static void closeClient() {
++  TCP_LOG("close\n");
++  xSemaphoreTake(txLock, portMAX_DELAY);
++  authed = false;
++  client.stop();
++  dropClient = false;
++  rx = "";
++  xSemaphoreGive(txLock);
++}
++
++bool ble_pop_cmd(String &line, uint32_t wait_ms) {
++  uint32_t start = millis();
++  do {
++    if (dropClient) closeClient();
++    static uint32_t beat;
++    if (millis() - beat > 3000) { beat = millis(); TCP_LOG("alive authed=%d conn=%d\n", (int)authed, (int)client.connected()); }
++    WiFiClient c = server.accept();
++    if (c) {  // a new client replaces the old one
++      xSemaphoreTake(txLock, portMAX_DELAY);
++      authed = false;
++      client.stop();
++      client = c;
++      client.setNoDelay(true);
++      dropClient = false;
++      rx = "";
++      connectedAt = millis();
++      TCP_LOG("client accepted\n");
++      xSemaphoreGive(txLock);
++    }
++    if (authed && !client.connected()) { TCP_LOG("peer went away\n"); closeClient(); }
++    if (client.connected()) {
++      if (!authed && millis() - connectedAt > AUTH_MS) closeClient();
++      while (client.connected() && client.available() && rx.length() <= RX_MAX) rx += (char)client.read();
++      if (rx.length() > RX_MAX) closeClient();
++      int nl = rx.indexOf('\n');
++      if (nl >= 0) {
++        String l = rx.substring(0, nl);
++        rx = rx.substring(nl + 1);
++        l.trim();
++        if (authed) { line = l; return true; }
++        if (l.startsWith("auth ") && constEq(l.substring(5), BRIDGE_TOKEN)) {
++          authed = true;
++          TCP_LOG("authed\n");
++          ble_reply("0 ok auth");
++        } else {
++          closeClient();
++        }
++        continue;
++      }
++    } else if (client) {
++      closeClient();  // peer went away
++    }
++    delay(5);
++  } while (millis() - start < wait_ms);
++  return false;
++}
++
++void ble_reply(const String &line) {
++  if (!authed) return;
++  if (!sendFrame('R', (const uint8_t *)line.c_str(), line.length(), REPLY_TIMEOUT_MS)) replyDrops++;
++}
++
++void ble_status(const String &json) { sendFrame('S', (const uint8_t *)json.c_str(), json.length(), STATUS_TIMEOUT_MS); }
++
++size_t ble_video_room() { return authed ? 1400 : 0; }
++
++bool ble_video_send(const uint8_t *p, size_t n) {
++  if (!sendFrame('V', p, n, VIDEO_TIMEOUT_MS)) { drops++; return false; }
++  uint32_t now = millis();
++  winBytes += n;
++  if (now - winStart >= 1000) {
++    kbps = winBytes * 8 / (now - winStart);
++    winBytes = 0;
++    winStart = now;
++  }
++  return true;
++}
++
++void ble_unpair() {}
++uint16_t ble_mtu() { return 1500; }
++uint8_t ble_phy() { return 0; }
++uint32_t ble_kbps() { return millis() - winStart > 2000 ? 0 : kbps; }
++uint32_t ble_drops() { return drops; }
++uint32_t ble_reply_drops() { return replyDrops; }
++int ble_peers() { return authed ? 1 : 0; }
+diff --git a/hardware/hid_bridge/video_link.cpp b/hardware/hid_bridge/video_link.cpp
+index 59a75b6..6d30891 100644
+--- a/hardware/hid_bridge/video_link.cpp
++++ b/hardware/hid_bridge/video_link.cpp
+@@ -9,7 +9,7 @@
+ const size_t GOP_CAP = 4 * 1024 * 1024;
+ const int MAX_AUS = 8192;
+ const size_t SCRATCH_CAP = 512 * 1024;   // largest access unit we forward
+-const size_t MAX_CHUNK = 512;
++const size_t MAX_CHUNK = 1400;
+ 
+ struct Req {
+   char id[16];

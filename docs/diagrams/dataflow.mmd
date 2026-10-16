@@ -1,0 +1,28 @@
+flowchart LR
+  subgraph HOST["Steuerrechner (Linux, Claude / Skripte)"]
+    CLI["bridge.py<br/>Befehle: move, click, type, homescreen"]
+    SHOT["screenshot.py<br/>snap + ffmpeg-Dekodierung"]
+    LLM["Agent / Vision-Modell<br/>(Ollama, optional)"]
+  end
+  subgraph ESP["ESP32-S3 (N16R8)"]
+    TCP["TCP-Bridge :7300<br/>Token-Auth, Frames R/S/V"]
+    AP["AirPlay-Empfaenger<br/>RTSP :7000, Mirror :7100"]
+    GOP["GOP-Puffer im PSRAM<br/>H.264 Annex-B"]
+    HID["USB-HID<br/>Maus + Tastatur + Consumer"]
+    WIFI["WLAN APSTA<br/>Client Heimnetz + Hotspot"]
+  end
+  subgraph PHONE["iPhone 13 Pro (iOS 27)"]
+    MIR["Bildschirmspiegelung"]
+    AT["AssistiveTouch<br/>Zeigergeraet"]
+  end
+  CLI -- "Textzeilen id + Befehl" --> TCP
+  SHOT -- "snap" --> TCP
+  TCP -- "R Antwort / S Status / V Video" --> SHOT
+  LLM -- "Aktion als JSON" --> CLI
+  SHOT -- "PNG" --> LLM
+  TCP -- "Befehl" --> HID
+  HID -- "USB ueber Lightning-Kamera-Adapter" --> AT
+  MIR -- "AirPlay ueber Hotspot ESP32Agent-XXXX" --> AP
+  AP -- "H.264 Access Units" --> GOP
+  GOP -- "Chunks" --> TCP
+  TCP --- WIFI
