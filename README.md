@@ -119,19 +119,36 @@ Den Chip prüfst du vorher mit `esptool --port /dev/ttyACM0 flash-id`: erwartet 
 
 ### 8. Rechnerseitig nutzen
 
-Die IP des Boards steht im Router oder im seriellen Log (`wifi: got ip ...`).
+Die IP des Boards steht im Router oder im seriellen Log (`wifi: got ip ...`). Das Board bedient **eine** TCP-Verbindung gleichzeitig. Deshalb gibt es zwei Wege:
+
+**a) Dauerbetrieb mit Dienst (empfohlen).** `tools/bridged.py` hält die Verbindung, dekodiert den H.264-Strom laufend mit PyAV und bewahrt das jeweils letzte Bild. Ein Screenshot dauert dann unter einer Sekunde. Ohne den Dienst muss jeder Screenshot den ganzen GOP neu dekodieren, und der enthält auf einem ruhigen Bildschirm tausende Bilder (Minuten).
 
 ```bash
-export BRIDGE_HOST=<board-ip>
-export BRIDGE_SECRETS=hardware/hid_bridge/secrets.h
+python3 -m venv --system-site-packages .venv && .venv/bin/pip install av
+export BRIDGE_HOST=<board-ip> BRIDGE_SECRETS=hardware/hid_bridge/secrets.h
+.venv/bin/python tools/bridged.py &            # vor dem Start der Spiegelung starten, nie neu starten
+
+python3 tools/remote.py shot screen.png        # aktuelles Bild
+python3 tools/remote.py cmd homescreen
+python3 tools/tap.py tap 276 726               # Zeiger auf Bildpunkt setzen, Hover pruefen, klicken
+python3 tools/tap.py type "info@example.org"   # mit Umsetzung fuer die deutsche Tastaturbelegung
+```
+
+> **Wichtig:** Das iPhone schickt auf einem ruhigen Bildschirm nur etwa stündlich einen Keyframe. Ein neu gestarteter Dienst kann ohne Keyframe nichts dekodieren, und der GOP-Puffer des Boards läuft nach etwa 27 Minuten über. Nach einem Neustart des Dienstes muss die Spiegelung am iPhone einmal gestoppt und neu gestartet werden.
+
+**b) Einzelbefehle ohne Dienst** (`bridge.py`, `screenshot.py`), nur zum Testen: Screenshots sind langsam.
+
+```bash
 python3 tools/bridge.py ping
 python3 tools/bridge.py homescreen
-python3 tools/bridge.py home            # Zeiger in die linke obere Ecke
 python3 tools/bridge.py "move 200 100"
-python3 tools/bridge.py click
-python3 tools/bridge.py "type hallo"
-python3 tools/screenshot.py screen.png
 ```
+
+### 9. Zeiger und Tastatur (gemessene Werte)
+
+- **Zeiger:** iOS zeichnet den Zeiger nicht in die Spiegelung, sichtbar sind nur das Hervorheben des Elements unter dem Zeiger und ein kleiner grauer Punkt. Mit `home` fährt der Zeiger in die linke obere Ecke. Gemessen auf dem iPhone 13 Pro: **0,93 Punkte pro Schritt horizontal, 0,76 vertikal** (`tools/calib.json`, der Wert hängt von iOS-Beschleunigung und Gerät ab). `tools/pointer.py` fährt auf einen Bildpunkt, prüft per Bildvergleich das Hervorheben und korrigiert bei Abweichung. Auf 7 von 7 Symbolen der Home-Seite getroffen.
+- **Text:** Das Board sendet US-Tastencodes, iOS liest sie mit **deutscher** Belegung. Aus `@` wurde `"`. `tools/typing_de.py` setzt um: `@` = Option+L, `#` = US-Taste `\`, y und z vertauscht, und weitere Satzzeichen. Mit der Umsetzung kamen `info@mpauli.de` und ein Passwort mit `##` korrekt an.
+- **Fokus in Textfeldern:** Ein Klick fokussiert nicht immer. Die Tab-Taste (`key tab`, rückwärts `key shift+tab`) ist zuverlässiger.
 
 ## TCP-Protokoll
 
@@ -177,6 +194,8 @@ Nach `home` und `move` rastet der Zeiger auf einem Symbol ein und hebt es hervor
 | Spiegelung `connected`, aber kein Video | gleiche Portkollision auf 7100 | siehe oben |
 | Board verbindet sich nicht mit dem WLAN, `reason 15` | Hotspot auf fest Kanal 6, Heim-WLAN auf anderem Kanal | zuerst Client verbinden, dann Hotspot auf denselben Kanal (`WiFi.channel()`) |
 | `reason 2` / `15` auch im reinen Client-Modus | manche WPA2-only-WLANs mit ESP32-S3 | ein anderes WLAN (WPA3-Transition) nutzen |
+| Kein Bild nach Neustart des Dienstes, Board meldet `streaming` und `gop: 0` | Dienst hat keinen Keyframe, Board-Puffer ist übergelaufen | Spiegelung am iPhone stoppen und neu starten, der Dienst läuft dabei |
+| `@` kommt als `"` an, `#` als `§` | iOS liest die US-Codes mit deutscher Belegung | `tools/typing_de.py` benutzen |
 | `homescreen` tut nichts, `usb: ok` | der Rechner ist USB-Host | Rechner-Kabel abziehen, `grep -c 'ESP32S3_DEV Mouse' /proc/bus/input/devices` muss 0 sein |
 | `usb: off` am iPhone | Lightning-Kabel direkt am Board | Kamera-Adapter verwenden |
 | `flash.sh` endet ohne Ausgabe | Port taucht nach dem 1200-Baud-Reset nicht auf | `arduino-cli upload` direkt, dann `esptool ... --after hard-reset` |
@@ -197,8 +216,8 @@ Fertig und getestet: Video (ca. 3 bis 6 Bilder/s, 480×1040), Home-Taste, Zeiger
 
 Offen:
 
-- **Genauigkeit des Zeigers**: iOS zeichnet den Zeiger nicht in die Spiegelung, nur das Hervorheben. Der Zeiger rastet außerdem auf Symbole ein. Eine saubere Zuordnung „Bildpunkt → Mausschritte" fehlt noch. Vorgesehen ist ein Regelkreis: bewegen, Screenshot, prüfen, was hervorgehoben ist, dann klicken.
-- **Agenten-Loop**: Screenshot → Vision-Modell (z. B. `qwen2.5vl:7b` auf Ollama) → Aktion als JSON → Bridge. Noch nicht umgesetzt.
+- **Agenten-Loop** (`tools/agent.py`): Screenshot → Vision-Modell (Ollama, z. B. `qwen2.5vl:7b`) → Aktion als JSON → Zeiger/Tastatur. Der Code steht (Stopp-Datei, Schrittlimit, Schleifenerkennung, Bestätigung bei riskanten Aktionen, Passwort nur als Platzhalter `{{PW}}`), ist aber **noch nicht gegen das echte iPhone gelaufen**: Der Ollama-Host war durch ein anderes, dauernd genutztes Modell belegt. Außerdem liefert `qwen2.5vl` über Ollama Koordinaten, die um etwa den Faktor 1,2 danebenliegen (interne Skalierung). Das muss vor dem Einsatz kalibriert werden.
+- **GOP-Puffer des Boards** läuft nach ca. 8192 Bildern über (`MAX_AUS` in `video_link.cpp`). Eine Firmware-Anpassung oder ein Keyframe-Anfrage-Mechanismus würde das Neustarten der Spiegelung ersparen.
 - **AirPlay nur auf dem Hotspot** anbieten statt auch im Heimnetz.
 - Die Spiegelung endet, wenn sich das iPhone sperrt. Dann antwortet die Bridge mit `err phone usb asleep`.
 
